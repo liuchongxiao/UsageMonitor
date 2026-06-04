@@ -2,6 +2,14 @@
 
 UsageMonitor is a macOS menu bar app with a WidgetKit widget for tracking Codex and Claude usage.
 
+## Downloads
+
+Prebuilt release artifacts are checked into `dist/`:
+
+- `dist/UsageMonitor-0.1.0-macos.dmg`
+- `dist/UsageMonitor-0.1.0-macos.zip`
+- `dist/UsageMonitor-0.1.0-checksums.txt`
+
 ## What it does
 
 - Shows Codex and Claude usage in the menu bar
@@ -30,4 +38,4 @@ xcodebuild -project UsageMonitor.xcodeproj -scheme UsageMonitor -configuration D
 
 ## Notes
 
-The repository is source-only. If you want packaged app downloads, build them locally from the Xcode project.
+The repository contains both source and release artifacts. Build locally from the Xcode project if you want to regenerate them.
