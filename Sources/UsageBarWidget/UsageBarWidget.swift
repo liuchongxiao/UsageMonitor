@@ -26,26 +26,13 @@ struct UsageBarWidgetView: View {
     let entry: UsageBarWidgetEntry
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                Image(systemName: "chart.bar.fill")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.72))
-                    .frame(width: 26)
-
-                Text("UsageMonitor")
-                    .font(.system(size: 20, weight: .heavy))
-                    .foregroundStyle(.white.opacity(0.78))
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(entry.snapshot.rows.prefix(5)) { row in
-                    UsageBarWidgetRowView(row: row)
-                }
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(entry.snapshot.rows.prefix(5)) { row in
+                UsageBarWidgetRowView(row: row)
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
         .containerBackground(for: .widget) {
             LinearGradient(
                 colors: [
@@ -63,7 +50,7 @@ private struct UsageBarWidgetRowView: View {
     let row: UsageWidgetRow
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 10) {
                 Image(systemName: row.systemImage)
                     .font(.system(size: 13, weight: .bold))
@@ -72,18 +59,12 @@ private struct UsageBarWidgetRowView: View {
                     .frame(width: 26)
 
                 Text(row.title)
-                    .font(.system(size: 16, weight: .heavy))
+                    .font(.system(size: 15, weight: .heavy))
                     .foregroundStyle(.white.opacity(row.isUnavailable ? 0.62 : 0.88))
                     .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+                    .minimumScaleFactor(0.82)
 
-                Spacer(minLength: 8)
-
-                Text(row.detail)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(row.isUnavailable ? 0.46 : 0.58))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.76)
+                Spacer(minLength: 0)
             }
 
             HStack(spacing: 8) {
@@ -91,13 +72,15 @@ private struct UsageBarWidgetRowView: View {
                     .font(.system(size: 12, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.white.opacity(row.isUnavailable ? 0.48 : 0.58))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.78)
 
                 Spacer(minLength: 8)
 
-                Text("已用 \(Int((100 - row.percent).rounded()))%")
-                    .font(.system(size: 12, weight: .semibold))
+                Text(row.detail)
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(row.isUnavailable ? 0.60 : 0.88))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.76)
             }
 
             UsageBarWidgetMeter(
@@ -106,9 +89,9 @@ private struct UsageBarWidgetRowView: View {
                 isUnavailable: row.isUnavailable,
                 fillsRemaining: row.fillsRemaining
             )
-                .frame(height: 7)
+                .frame(height: 6)
         }
-        .frame(minHeight: 30)
+        .frame(minHeight: 32)
     }
 
     private var iconTint: Color {
