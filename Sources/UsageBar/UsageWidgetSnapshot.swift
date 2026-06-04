@@ -27,7 +27,7 @@ struct UsageWidgetSnapshot: Codable, Equatable {
                 tintName: "coral",
                 percent: 0,
                 detail: "等待刷新",
-                fillsRemaining: false,
+                fillsRemaining: true,
                 isUnavailable: true
             )
         ]

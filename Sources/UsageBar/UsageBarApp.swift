@@ -146,7 +146,7 @@ final class UsageStore: ObservableObject {
             row.detail = UsageWidgetResetText.text(for: snapshot.primary?.resetDate)
             row.isCritical = remainingPercent <= 10
             row.isUnavailable = snapshot.primary == nil
-            row.fillsRemaining = id == "codex"
+            row.fillsRemaining = true
         }
 
         rows[index] = row
@@ -1162,7 +1162,7 @@ struct UsagePanel: View {
                         usedPercent: primary.usedPercent,
                         window: primary,
                         tint: primaryTint(for: snapshot.provider),
-                        fillsRemaining: snapshot.provider == .codex
+                        fillsRemaining: true
                     )
                 }
 
@@ -1174,7 +1174,7 @@ struct UsagePanel: View {
                         usedPercent: secondary.usedPercent,
                         window: secondary,
                         tint: Color(red: 0.80, green: 0.92, blue: 0.17),
-                        fillsRemaining: snapshot.provider == .codex
+                        fillsRemaining: true
                     )
                 }
 
