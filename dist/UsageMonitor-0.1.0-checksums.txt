@@ -1,0 +1,2 @@
+d717e3da9300716dbc546b251ab67f3cce694e12b38fccf004e8c8580d22255e  dist/UsageMonitor-0.1.0-macos.dmg
+6dd78792c99f1b511e0e276e8bc061bfa06e31ed4676abe66d5ee2cf24f0f8d9  dist/UsageMonitor-0.1.0-macos.zip
