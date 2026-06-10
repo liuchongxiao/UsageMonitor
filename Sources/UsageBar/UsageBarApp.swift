@@ -419,9 +419,21 @@ private final class ClaudeUsageReader {
 private final class ClaudeOAuthUsageReader {
     private let decoder = JSONDecoder()
 
+    private static let tokenEndpoint = "https://console.anthropic.com/v1/oauth/token"
+    /// Claude Code CLI 的公开 OAuth client id，刷新 token 时必须携带。
+    private static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
     func latestSnapshot() throws -> UsageSnapshot {
-        let token = try keychainToken()
-        let usageData = try syncGet("https://api.anthropic.com/api/oauth/usage", token: token)
+        do {
+            return try snapshot(token: try usableToken())
+        } catch ClaudeUsageError.httpStatus(401) {
+            // token 未到期却被判无效（被撤销/时钟漂移）时，强制刷新一次再试。
+            return try snapshot(token: try refreshAndPersist(try loadCredentials()))
+        }
+    }
+
+    private func snapshot(token: String) throws -> UsageSnapshot {
+        let usageData = try syncRequest("https://api.anthropic.com/api/oauth/usage", token: token)
         let usage = try decoder.decode(OAuthUsageResponse.self, from: usageData)
 
         guard usage.fiveHour != nil || usage.sevenDay != nil else {
@@ -450,7 +462,7 @@ private final class ClaudeOAuthUsageReader {
 
     /// profile 端点同样零 token，用来补上代码里一直为空的 plan_type；失败就忽略。
     private func planType(token: String) -> String? {
-        guard let data = try? syncGet("https://api.anthropic.com/api/oauth/profile", token: token),
+        guard let data = try? syncRequest("https://api.anthropic.com/api/oauth/profile", token: token),
               let profile = try? decoder.decode(OAuthProfileResponse.self, from: data) else {
             return nil
         }
@@ -460,7 +472,22 @@ private final class ClaudeOAuthUsageReader {
         return profile.organization?.organizationType?.replacingOccurrences(of: "claude_", with: "")
     }
 
-    private func keychainToken() throws -> String {
+    private func usableToken() throws -> String {
+        let credentials = try loadCredentials()
+
+        // 留 60s 余量：临期 token 也直接刷新，避免请求中途过期。
+        if let expiresAtMs = credentials.expiresAtMs,
+           Date().timeIntervalSince1970 > expiresAtMs / 1000 - 60 {
+            return try refreshAndPersist(credentials)
+        }
+
+        guard let token = credentials.accessToken, !token.isEmpty else {
+            throw ClaudeUsageError.noToken
+        }
+        return token
+    }
+
+    private func loadCredentials() throws -> ClaudeCredentials {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
@@ -477,28 +504,86 @@ private final class ClaudeOAuthUsageReader {
 
         let data = output.fileHandleForReading.readDataToEndOfFile()
         guard process.terminationStatus == 0,
-              let creds = try? decoder.decode(KeychainCredentials.self, from: data) else {
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let oauth = root["claudeAiOauth"] as? [String: Any] else {
             throw ClaudeUsageError.noToken
         }
 
-        let oauth = creds.claudeAiOauth
-        if let expiresAt = oauth.expiresAt, Date().timeIntervalSince1970 > expiresAt / 1000 {
+        return ClaudeCredentials(root: root, oauth: oauth)
+    }
+
+    /// 用 refreshToken 换新 access token 并写回钥匙串。
+    /// refresh token 是轮换式的：刷新成功后旧的随即作废，必须立刻持久化新
+    /// 的 access/refresh token，否则会把 Claude Code 自己的登录弄失效。
+    private func refreshAndPersist(_ credentials: ClaudeCredentials) throws -> String {
+        guard let refreshToken = credentials.refreshToken, !refreshToken.isEmpty else {
+            throw ClaudeUsageError.tokenExpired
+        }
+        guard ClaudeTokenRefreshGate.beginAttempt() else {
             throw ClaudeUsageError.tokenExpired
         }
 
-        guard !oauth.accessToken.isEmpty else { throw ClaudeUsageError.noToken }
-        return oauth.accessToken
+        let body = try JSONSerialization.data(withJSONObject: [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": Self.oauthClientID
+        ])
+
+        guard let data = try? syncRequest(Self.tokenEndpoint, method: "POST", jsonBody: body),
+              let token = try? decoder.decode(OAuthTokenResponse.self, from: data) else {
+            throw ClaudeUsageError.refreshFailed
+        }
+
+        var oauth = credentials.oauth
+        oauth["accessToken"] = token.accessToken
+        oauth["refreshToken"] = token.refreshToken ?? refreshToken
+        oauth["expiresAt"] = ((Date().timeIntervalSince1970 + token.expiresIn) * 1000).rounded()
+        var root = credentials.root
+        root["claudeAiOauth"] = oauth
+
+        persist(root)
+        return token.accessToken
     }
 
-    private func syncGet(_ urlString: String, token: String) throws -> Data {
+    /// 写回失败时不抛错：刷新已经发生，至少先让本次查询用上新 token。
+    private func persist(_ root: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: root),
+              let json = String(data: data, encoding: .utf8) else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = [
+            "add-generic-password", "-U",
+            "-a", NSUserName(),
+            "-s", "Claude Code-credentials",
+            "-w", json
+        ]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
+    }
+
+    private func syncRequest(
+        _ urlString: String,
+        method: String = "GET",
+        token: String? = nil,
+        jsonBody: Data? = nil
+    ) throws -> Data {
         guard let url = URL(string: urlString) else { throw ClaudeUsageError.invalidResponse }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        request.httpMethod = method
         request.timeoutInterval = 10
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        }
+        if let jsonBody {
+            request.httpBody = jsonBody
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
 
         let semaphore = DispatchSemaphore(value: 0)
         let result = SyncRequestResult()
@@ -598,12 +683,41 @@ private struct OAuthProfileResponse: Decodable {
     }
 }
 
-private struct KeychainCredentials: Decodable {
-    let claudeAiOauth: OAuth
+/// 钥匙串里的完整凭据 blob。保留原始字典原样写回，避免丢掉
+/// scopes/subscriptionType 等 Claude Code 自己要用的字段。
+private struct ClaudeCredentials {
+    let root: [String: Any]
+    let oauth: [String: Any]
 
-    struct OAuth: Decodable {
-        let accessToken: String
-        let expiresAt: Double?
+    var accessToken: String? { oauth["accessToken"] as? String }
+    var refreshToken: String? { oauth["refreshToken"] as? String }
+    var expiresAtMs: Double? { (oauth["expiresAt"] as? NSNumber)?.doubleValue }
+}
+
+private struct OAuthTokenResponse: Decodable {
+    let accessToken: String
+    let refreshToken: String?
+    let expiresIn: Double
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case expiresIn = "expires_in"
+    }
+}
+
+/// 刷新尝试至少间隔 5 分钟：refresh token 已失效时不会反复打 token 端点。
+private enum ClaudeTokenRefreshGate {
+    private static let lock = NSLock()
+    // 由 lock 保护，并发安全检查在此关闭。
+    nonisolated(unsafe) private static var lastAttempt = Date.distantPast
+
+    static func beginAttempt() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard Date().timeIntervalSince(lastAttempt) >= 300 else { return false }
+        lastAttempt = Date()
+        return true
     }
 }
 
@@ -966,6 +1080,7 @@ private enum ClaudeUsageError: LocalizedError {
     case invalidCache
     case noToken
     case tokenExpired
+    case refreshFailed
     case requestTimedOut
     case httpStatus(Int)
     case invalidResponse
@@ -980,6 +1095,8 @@ private enum ClaudeUsageError: LocalizedError {
             return "没能从钥匙串读取 Claude Code OAuth token。请先在 Claude Code 登录。"
         case .tokenExpired:
             return "Claude Code OAuth token 已过期，请重新登录后再刷新。"
+        case .refreshFailed:
+            return "自动刷新 Claude OAuth token 失败，请打开 Claude Code 重新登录一次。"
         case .requestTimedOut:
             return "查询 Claude 用量端点超时。"
         case .httpStatus(let code):
