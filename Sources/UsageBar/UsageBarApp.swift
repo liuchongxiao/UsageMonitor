@@ -28,6 +28,7 @@ final class UsageStore: ObservableObject {
     @Published private(set) var claudeState: UsageState = .loading {
         didSet { scheduleWidgetSnapshotPersistence() }
     }
+    @Published private(set) var claudeRefreshStatus: UsageRefreshStatus?
     @Published var selectedProvider: UsageProvider = .codex
 
     private var timer: Timer?
@@ -66,6 +67,15 @@ final class UsageStore: ObservableObject {
         }
     }
 
+    func refreshStatus(for provider: UsageProvider) -> UsageRefreshStatus? {
+        switch provider {
+        case .codex:
+            return nil
+        case .claude:
+            return claudeRefreshStatus
+        }
+    }
+
     init() {
         start()
     }
@@ -82,7 +92,7 @@ final class UsageStore: ObservableObject {
 
         let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.refresh()
+                self?.refreshScheduled()
             }
         }
         // 加到 .common 模式，弹窗打开（事件跟踪模式）时计时器也能继续触发。
@@ -92,8 +102,16 @@ final class UsageStore: ObservableObject {
     }
 
     func refresh() {
+        refresh(force: true)
+    }
+
+    private func refreshScheduled() {
+        refresh(force: false)
+    }
+
+    private func refresh(force: Bool) {
         refreshCodex()
-        refreshClaude()
+        refreshClaude(force: force)
     }
 
     private func scheduleWidgetSnapshotPersistence() {
@@ -111,7 +129,8 @@ final class UsageStore: ObservableObject {
         updateWidgetRow(id: "codex", state: codexState, rows: &rows)
         let snapshot = UsageWidgetSnapshot(updatedAt: Date(), rows: rows)
 
-        guard snapshot != lastPersistedWidgetSnapshot else {
+        guard snapshot.rows != lastPersistedWidgetSnapshot?.rows else {
+            lastPersistedWidgetSnapshot = snapshot
             return
         }
 
@@ -169,42 +188,89 @@ final class UsageStore: ObservableObject {
         }
     }
 
-    private func refreshClaude() {
+    private func refreshClaude(force: Bool) {
+        if claudeRefreshTask != nil {
+            if force {
+                claudeRefreshStatus = .refreshing
+            }
+            return
+        }
+
         let now = Date()
         // 429 退避期内直接跳过，让端点冷却。
-        if now < claudeBackoffUntil { return }
-        // 节流：任意来源（手点/计时器）最短 30s 才真正发一次请求，避免打爆端点触发 429。
-        if now.timeIntervalSince(lastClaudeAttempt) < 30 { return }
-        lastClaudeAttempt = now
+        if now < claudeBackoffUntil {
+            if force {
+                _ = applyClaudeFallback(after: ClaudeUsageError.temporarilyBackedOff)
+                claudeRefreshStatus = .coolingDown(until: claudeBackoffUntil)
+            }
+            return
+        }
 
-        claudeRefreshTask?.cancel()
-        claudeRefreshTask = Task { @MainActor in
+        // 定时刷新才节流；手动刷新不应该看起来“没反应”。
+        if !force, now.timeIntervalSince(lastClaudeAttempt) < 55 { return }
+        lastClaudeAttempt = now
+        if force {
+            claudeRefreshStatus = .refreshing
+        }
+
+        claudeRefreshTask = Task { @MainActor [weak self] in
+            defer { self?.claudeRefreshTask = nil }
+
             do {
                 let snapshot = try await Task.detached {
                     try ClaudeOAuthUsageReader().latestSnapshot()
                 }.value
 
                 guard !Task.isCancelled else { return }
-                claudeLive = snapshot          // 记住最近一次成功的实时结果
-                claudeState = .loaded(snapshot)
+                self?.claudeLive = snapshot
+                try? ClaudeSnapshotCache.save(snapshot)
+                self?.claudeState = .loaded(snapshot)
+                self?.claudeRefreshStatus = nil
             } catch {
                 guard !Task.isCancelled else { return }
-
-                if case ClaudeUsageError.httpStatus(429) = error {
-                    claudeBackoffUntil = Date().addingTimeInterval(180)
-                }
-
-                // 失败时优先保留上次实时结果（时间会变旧但不会倒退到很久前的磁盘缓存）；
-                // 完全没有实时结果时才退到 Stop hook 写的本地缓存。
-                if let live = claudeLive {
-                    claudeState = .loaded(live)
-                } else if let cache = try? ClaudeCacheUsageReader().latestSnapshot() {
-                    claudeState = .loaded(cache)
-                } else {
-                    claudeState = .unavailable(error.localizedDescription)
+                let usedFallback = self?.applyClaudeFallback(after: error) ?? false
+                if force {
+                    self?.claudeRefreshStatus = self?.statusAfterClaudeRefreshError(error, usedFallback: usedFallback)
                 }
             }
         }
+    }
+
+    private func applyClaudeFallback(after error: Error) -> Bool {
+        if case ClaudeUsageError.httpStatus(429) = error {
+            claudeBackoffUntil = Date().addingTimeInterval(180)
+        }
+
+        if let live = claudeLive {
+            claudeState = .loaded(live)
+            return true
+        }
+
+        if let cached = try? ClaudeSnapshotCache.load() {
+            claudeLive = cached
+            claudeState = .loaded(cached)
+            return true
+        }
+
+        if let hookCache = try? ClaudeCacheUsageReader().latestSnapshot() {
+            claudeLive = hookCache
+            claudeState = .loaded(hookCache)
+            return true
+        }
+
+        claudeState = .unavailable(error.localizedDescription)
+        return false
+    }
+
+    private func statusAfterClaudeRefreshError(_ error: Error, usedFallback: Bool) -> UsageRefreshStatus {
+        if case ClaudeUsageError.httpStatus(429) = error {
+            return .coolingDown(until: claudeBackoffUntil)
+        }
+
+        let message = usedFallback
+            ? "刷新失败，继续显示上次数据：\(error.localizedDescription)"
+            : error.localizedDescription
+        return .failed(message)
     }
 
     func openUsagePage(for provider: UsageProvider) {
@@ -261,6 +327,45 @@ enum UsageState {
     case loading
     case loaded(UsageSnapshot)
     case unavailable(String)
+}
+
+enum UsageRefreshStatus {
+    case refreshing
+    case coolingDown(until: Date)
+    case failed(String)
+
+    var icon: String {
+        switch self {
+        case .refreshing:
+            return "arrow.triangle.2.circlepath"
+        case .coolingDown:
+            return "clock"
+        case .failed:
+            return "exclamationmark.triangle"
+        }
+    }
+
+    var text: String {
+        switch self {
+        case .refreshing:
+            return "正在刷新 Claude..."
+        case .coolingDown(let until):
+            return "Claude 接口冷却中，\(ResetFormatter.durationText(until: until))后再试"
+        case .failed(let message):
+            return message
+        }
+    }
+
+    var refreshButtonTitle: String {
+        switch self {
+        case .refreshing:
+            return "正在刷新..."
+        case .coolingDown:
+            return "冷却中"
+        case .failed:
+            return "重新刷新"
+        }
+    }
 }
 
 struct UsageSnapshot {
@@ -475,6 +580,10 @@ private final class ClaudeOAuthUsageReader {
     private func usableToken() throws -> String {
         let credentials = try loadCredentials()
 
+        if credentials.isEmptyAuth {
+            throw ClaudeUsageError.notLoggedIn
+        }
+
         // 留 60s 余量：临期 token 也直接刷新，避免请求中途过期。
         if let expiresAtMs = credentials.expiresAtMs,
            Date().timeIntervalSince1970 > expiresAtMs / 1000 - 60 {
@@ -517,7 +626,7 @@ private final class ClaudeOAuthUsageReader {
     /// 的 access/refresh token，否则会把 Claude Code 自己的登录弄失效。
     private func refreshAndPersist(_ credentials: ClaudeCredentials) throws -> String {
         guard let refreshToken = credentials.refreshToken, !refreshToken.isEmpty else {
-            throw ClaudeUsageError.tokenExpired
+            throw credentials.isEmptyAuth ? ClaudeUsageError.notLoggedIn : ClaudeUsageError.tokenExpired
         }
         guard ClaudeTokenRefreshGate.beginAttempt() else {
             throw ClaudeUsageError.tokenExpired
@@ -692,6 +801,11 @@ private struct ClaudeCredentials {
     var accessToken: String? { oauth["accessToken"] as? String }
     var refreshToken: String? { oauth["refreshToken"] as? String }
     var expiresAtMs: Double? { (oauth["expiresAt"] as? NSNumber)?.doubleValue }
+    var isEmptyAuth: Bool {
+        (accessToken?.isEmpty ?? true)
+            && (refreshToken?.isEmpty ?? true)
+            && (expiresAtMs ?? 0) <= 0
+    }
 }
 
 private struct OAuthTokenResponse: Decodable {
@@ -764,6 +878,105 @@ private final class ClaudeCacheUsageReader {
         }
 
         return fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+    }
+}
+
+private enum ClaudeSnapshotCache {
+    private static let fileName = "claude-oauth-usage.json"
+
+    static func save(_ snapshot: UsageSnapshot) throws {
+        guard snapshot.provider == .claude else { return }
+
+        let cache = CachedClaudeSnapshot(snapshot: snapshot)
+        let url = cacheURL()
+        if let existingData = try? Data(contentsOf: url),
+           let existingCache = try? JSONDecoder().decode(CachedClaudeSnapshot.self, from: existingData),
+           existingCache.hasSameUsage(as: cache) {
+            return
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(cache)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func load() throws -> UsageSnapshot {
+        let url = cacheURL()
+        let data = try Data(contentsOf: url)
+        let cache = try JSONDecoder().decode(CachedClaudeSnapshot.self, from: data)
+        let snapshot = cache.snapshot(sourcePath: url.path)
+
+        if let resetDate = snapshot.primary?.resetDate,
+           resetDate < Date().addingTimeInterval(-60) {
+            throw ClaudeUsageError.noCache
+        }
+
+        return snapshot
+    }
+
+    private static func cacheURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("UsageMonitor")
+            .appendingPathComponent(fileName)
+    }
+}
+
+private struct CachedClaudeSnapshot: Codable {
+    let updatedAt: Date
+    let planType: String?
+    let primary: CachedRateLimitWindow?
+    let secondary: CachedRateLimitWindow?
+
+    init(snapshot: UsageSnapshot) {
+        updatedAt = snapshot.updatedAt
+        planType = snapshot.planType
+        primary = snapshot.primary.map { CachedRateLimitWindow(window: $0) }
+        secondary = snapshot.secondary.map { CachedRateLimitWindow(window: $0) }
+    }
+
+    func snapshot(sourcePath: String) -> UsageSnapshot {
+        UsageSnapshot(
+            provider: .claude,
+            updatedAt: updatedAt,
+            sourcePath: sourcePath,
+            planType: planType,
+            primary: primary?.rateLimitWindow,
+            secondary: secondary?.rateLimitWindow,
+            credits: nil
+        )
+    }
+
+    func hasSameUsage(as other: CachedClaudeSnapshot) -> Bool {
+        planType == other.planType
+            && primary == other.primary
+            && secondary == other.secondary
+    }
+}
+
+private struct CachedRateLimitWindow: Codable, Equatable {
+    let usedPercent: Double
+    let windowMinutes: Double?
+    let resetsAt: Double?
+
+    init(window: RateLimitWindow) {
+        usedPercent = window.usedPercent
+        windowMinutes = window.windowMinutes
+        resetsAt = window.resetsAt
+    }
+
+    var rateLimitWindow: RateLimitWindow {
+        RateLimitWindow(
+            usedPercent: usedPercent,
+            windowMinutes: windowMinutes,
+            resetsAt: resetsAt
+        )
     }
 }
 
@@ -1079,11 +1292,13 @@ private enum ClaudeUsageError: LocalizedError {
     case noCache
     case invalidCache
     case noToken
+    case notLoggedIn
     case tokenExpired
     case refreshFailed
     case requestTimedOut
     case httpStatus(Int)
     case invalidResponse
+    case temporarilyBackedOff
 
     var errorDescription: String? {
         switch self {
@@ -1093,6 +1308,8 @@ private enum ClaudeUsageError: LocalizedError {
             return "Claude usage 缓存格式不正确。请让 Claude Code 再结束一次对话回合刷新缓存。"
         case .noToken:
             return "没能从钥匙串读取 Claude Code OAuth token。请先在 Claude Code 登录。"
+        case .notLoggedIn:
+            return "Claude Code 当前未登录。请在终端运行 claude auth login 后再刷新。"
         case .tokenExpired:
             return "Claude Code OAuth token 已过期，请重新登录后再刷新。"
         case .refreshFailed:
@@ -1103,6 +1320,8 @@ private enum ClaudeUsageError: LocalizedError {
             return "Claude 用量端点返回 HTTP \(code)。"
         case .invalidResponse:
             return "Claude 用量端点返回了无法解析的内容。"
+        case .temporarilyBackedOff:
+            return "Claude 用量端点正在退避冷却，稍后会自动重试。"
         }
     }
 }
@@ -1204,6 +1423,10 @@ struct UsagePanel: View {
         store.state(for: provider)
     }
 
+    private var refreshStatus: UsageRefreshStatus? {
+        store.refreshStatus(for: provider)
+    }
+
     var body: some View {
         ZStack {
             LinearGradient(
@@ -1257,10 +1480,15 @@ struct UsagePanel: View {
                     .foregroundStyle(.white.opacity(0.68))
                     .fixedSize(horizontal: false, vertical: true)
 
+                if let refreshStatus {
+                    RefreshStatusView(status: refreshStatus)
+                }
+
                 ActionRow(
                     onRefresh: store.refresh,
                     onOpenUsage: { store.openUsagePage(for: provider) },
-                    provider: provider
+                    provider: provider,
+                    refreshStatus: refreshStatus
                 )
             }
 
@@ -1302,10 +1530,15 @@ struct UsagePanel: View {
                 Divider()
                     .overlay(.white.opacity(0.12))
 
+                if let refreshStatus {
+                    RefreshStatusView(status: refreshStatus)
+                }
+
                 ActionRow(
                     onRefresh: store.refresh,
                     onOpenUsage: { store.openUsagePage(for: snapshot.provider) },
-                    provider: snapshot.provider
+                    provider: snapshot.provider,
+                    refreshStatus: refreshStatus
                 )
             }
         }
@@ -1558,12 +1791,49 @@ private struct ActionRow: View {
     let onRefresh: () -> Void
     let onOpenUsage: () -> Void
     let provider: UsageProvider
+    let refreshStatus: UsageRefreshStatus?
 
     var body: some View {
         VStack(spacing: 4) {
-            ActionButton(icon: "arrow.clockwise", title: "刷新", action: onRefresh)
+            ActionButton(
+                icon: refreshStatus?.icon ?? "arrow.clockwise",
+                title: refreshStatus?.refreshButtonTitle ?? "刷新",
+                action: onRefresh
+            )
             ActionButton(icon: "chart.bar.xaxis", title: "\(provider.title) 用量页", action: onOpenUsage)
             ActionButton(icon: "power", title: "退出", action: { NSApp.terminate(nil) })
+        }
+    }
+}
+
+private struct RefreshStatusView: View {
+    let status: UsageRefreshStatus
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: status.icon)
+                .font(.system(size: 13, weight: .bold))
+                .frame(width: 18)
+
+            Text(status.text)
+                .font(.system(size: 12, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(foregroundStyle)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var foregroundStyle: Color {
+        switch status {
+        case .refreshing:
+            return .white.opacity(0.70)
+        case .coolingDown:
+            return Color(red: 0.95, green: 0.76, blue: 0.34)
+        case .failed:
+            return Color(red: 0.95, green: 0.55, blue: 0.38)
         }
     }
 }
@@ -1622,6 +1892,19 @@ private enum PercentFormatter {
 }
 
 private enum ResetFormatter {
+    static func durationText(until date: Date) -> String {
+        let seconds = Int(date.timeIntervalSinceNow)
+        guard seconds > 0 else { return "现在" }
+
+        let minutes = max(1, Int(ceil(Double(seconds) / 60)))
+        let hours = minutes / 60
+        if hours > 0 {
+            return "\(hours)小时\(minutes % 60)分钟"
+        }
+
+        return "\(minutes)分钟"
+    }
+
     static func shortText(for date: Date?) -> String {
         guard let date else { return "未知重置时间" }
 

@@ -164,6 +164,11 @@ enum UsageWidgetStore {
     private static func snapshotURLs() -> [URL] {
         var urls: [URL] = []
         let fileManager = FileManager.default
+        func appendUnique(_ url: URL) {
+            guard !urls.contains(url) else { return }
+            urls.append(url)
+        }
+
         let applicationSupportURL = fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent("Library")
             .appendingPathComponent("Application Support")
@@ -175,22 +180,13 @@ enum UsageWidgetStore {
             .appendingPathComponent(legacyApplicationSupportDirectoryName)
             .appendingPathComponent(fileName)
 
-        if Bundle.main.bundleIdentifier == "local.usagebar.codex.widget",
-           fileManager.fileExists(atPath: applicationSupportURL.path) {
-            return [applicationSupportURL]
-        }
-        if Bundle.main.bundleIdentifier == "local.usagebar.codex.widget",
-           fileManager.fileExists(atPath: legacyApplicationSupportURL.path) {
-            return [legacyApplicationSupportURL]
-        }
-
         if let containerURL = fileManager.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupIdentifier
         ) {
-            urls.append(containerURL.appendingPathComponent(fileName))
+            appendUnique(containerURL.appendingPathComponent(fileName))
         }
 
-        urls.append(
+        appendUnique(
             fileManager.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library")
                 .appendingPathComponent("Group Containers")
@@ -198,10 +194,10 @@ enum UsageWidgetStore {
                 .appendingPathComponent(fileName)
         )
 
-        urls.append(applicationSupportURL)
-        urls.append(legacyApplicationSupportURL)
+        appendUnique(applicationSupportURL)
+        appendUnique(legacyApplicationSupportURL)
 
-        urls.append(
+        appendUnique(
             fileManager.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library")
                 .appendingPathComponent("Containers")
@@ -213,7 +209,7 @@ enum UsageWidgetStore {
                 .appendingPathComponent(fileName)
         )
 
-        urls.append(
+        appendUnique(
             fileManager.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library")
                 .appendingPathComponent("Containers")

@@ -86,8 +86,7 @@ private struct UsageBarWidgetRowView: View {
             UsageBarWidgetMeter(
                 value: row.percent,
                 tint: meterTint,
-                isUnavailable: row.isUnavailable,
-                fillsRemaining: row.fillsRemaining
+                isUnavailable: row.isUnavailable
             )
                 .frame(height: 6)
         }
@@ -124,7 +123,6 @@ private struct UsageBarWidgetMeter: View {
     let value: Double
     let tint: Color
     let isUnavailable: Bool
-    let fillsRemaining: Bool
 
     var body: some View {
         GeometryReader { proxy in
@@ -134,7 +132,7 @@ private struct UsageBarWidgetMeter: View {
 
                 RoundedRectangle(cornerRadius: 5)
                     .fill(isUnavailable ? .white.opacity(0.16) : tint)
-                    .frame(width: proxy.size.width * max(0, min(fillsRemaining ? value : 100 - value, 100)) / 100)
+                    .frame(width: proxy.size.width * max(0, min(value, 100)) / 100)
 
                 HStack(spacing: 0) {
                     ForEach(1..<4) { index in
